@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>subdec — декодер VPN-подписок</title>
+<meta name="description" content="Достаёт JSON из VPN-подписок: base64, списки ссылок, Happ crypt. Работает локально в браузере.">
+<style>
+:root{--bg:#fafafa;--fg:#18181b;--mut:#71717a;--card:#fff;--bd:#e4e4e7;--ac:#4f46e5;--ac-fg:#fff;--err:#dc2626;--code:#f4f4f5}
+@media (prefers-color-scheme:dark){:root{--bg:#09090b;--fg:#fafafa;--mut:#a1a1aa;--card:#111114;--bd:#27272a;--ac:#818cf8;--ac-fg:#09090b;--err:#f87171;--code:#18181b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,Segoe UI,sans-serif}
+main{max-width:760px;margin:0 auto;padding:48px 16px 64px}
+h1{font-size:28px;margin:0 0 4px;letter-spacing:-.02em}
+h1 span{color:var(--ac)}
+.sub{color:var(--mut);margin:0 0 28px}
+textarea,input[type=file]{width:100%;background:var(--card);color:var(--fg);border:1px solid var(--bd);border-radius:10px;padding:12px;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace}
+textarea{min-height:130px;resize:vertical}
+textarea:focus,button:focus-visible,summary:focus-visible{outline:2px solid var(--ac);outline-offset:2px}
+details{margin:12px 0;color:var(--mut);font-size:14px}
+summary{cursor:pointer}
+details textarea{min-height:90px;margin-top:8px}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+button{background:var(--ac);color:var(--ac-fg);border:0;border-radius:8px;padding:9px 16px;font:inherit;font-weight:600;cursor:pointer}
+button.ghost{background:transparent;color:var(--fg);border:1px solid var(--bd);font-weight:500}
+#out{margin-top:28px}
+.steps{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:12px}
+.chip{background:var(--code);border:1px solid var(--bd);border-radius:999px;padding:2px 10px;font-size:12px;color:var(--mut)}
+pre{background:var(--code);border:1px solid var(--bd);border-radius:10px;padding:14px;overflow:auto;max-height:520px;font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;margin:0}
+.err{color:var(--err);border:1px solid var(--err);border-radius:10px;padding:12px}
+.tabs{display:flex;gap:6px;margin-bottom:8px}
+.tabs button{padding:5px 12px;font-size:13px}
+footer{margin-top:40px;color:var(--mut);font-size:13px}
+a{color:var(--ac)}
+</style>
+</head>
+<body>
+<main>
+  <h1>sub<span>dec</span></h1>
+  <p class="sub">Вставьте подписку — получите JSON. Всё выполняется в вашем браузере, ничего не отправляется на сервер.</p>
+
+  <textarea id="in" spellcheck="false" placeholder="base64, список vless:// vmess:// ss:// trojan://, JSON, happ://add/…, https://… или happ://crypt3/…"></textarea>
+
+  <details id="keybox">
+    <summary>Приватный RSA-ключ для happ://crypt* (необязательно)</summary>
+    <textarea id="key" spellcheck="false" placeholder="-----BEGIN RSA PRIVATE KEY----- …"></textarea>
+  </details>
+
+  <div class="row">
+    <button id="go">Декодировать</button>
+    <button class="ghost" id="file">Открыть файл</button>
+    <button class="ghost" id="clear">Очистить</button>
+    <input type="file" id="fileIn" hidden>
+  </div>
+
+  <section id="out" hidden>
+    <div class="steps" id="steps"></div>
+    <div class="tabs" id="tabs"></div>
+    <pre id="res"></pre>
+    <div class="row"><button class="ghost" id="copy">Копировать</button><button class="ghost" id="save">Скачать .json</button></div>
+  </section>
+
+  <footer>
+    <a href="https://github.com/SpecFlowdev/subdec">Исходники и CLI</a> · MIT.
+    HTTP-ссылки браузер скачать не может (CORS) — используйте CLI или вставьте содержимое.
+  </footer>
+</main>
+
+<script>
+"use strict";
+const SCHEMES = ["vless","vmess","trojan","ss","hysteria2","hy2","tuic","wireguard"];
+class DecodeError extends Error {}
+
+// ---- base64 ----
+function b64loose(text){
+  const s = text.replace(/\s+/g,"");
+  if(!s || !/^[A-Za-z0-9+/_\-]+={0,2}$/.test(s)) return null;
+  let t = s.replace(/=+$/,"").replace(/-/g,"+").replace(/_/g,"/");
+  if(t.length % 4 === 1) return null;
+  t += "=".repeat((4 - t.length % 4) % 4);
+  try{ const bin = atob(t); return Uint8Array.from(bin, c => c.charCodeAt(0)); }catch{ return null; }
+}
+function asText(bytes){
+  try{
+    const t = new TextDecoder("utf-8",{fatal:true}).decode(bytes);
+    if(!t) return null;
+    let ok = 0; for(const c of t) if(/[\P{C}\n\r\t]/u.test(c)) ok++;
+    return ok / [...t].length > 0.95 ? t : null;
+  }catch{ return null; }
+}
+
+// ---- RSA PKCS#1 v1.5 ----
+function der(d,p=0){
+  const tag=d[p]; let len=d[p+1]; p+=2;
+  if(len & 0x80){ const n=len&0x7f; len=0; for(let i=0;i<n;i++) len=len*256+d[p+i]; p+=n; }
+  return {tag, body:d.subarray(p,p+len), end:p+len};
+}
+function derSeq(d){
+  const s=der(d); if(s.tag!==0x30) throw new DecodeError("ключ: ожидалась ASN.1 SEQUENCE");
+  const items=[]; let p=0;
+  while(p<s.body.length){ const x=der(s.body,p); items.push(x); p=x.end; }
+  return items;
+}
+const big = b => b.reduce((a,x)=>a*256n+BigInt(x),0n);
+function loadKey(pem){
+  const m = pem.match(/-----BEGIN ([A-Z ]*PRIVATE KEY)-----([\s\S]+?)-----END/);
+  if(!m) throw new DecodeError("ключ: PEM приватный ключ не найден");
+  if(m[1]==="ENCRYPTED PRIVATE KEY") throw new DecodeError("ключ: зашифрованные ключи не поддерживаются");
+  let items = derSeq(b64loose(m[2]) || (()=>{throw new DecodeError("ключ: битый base64")})());
+  if(m[1]==="PRIVATE KEY") items = derSeq(items[2].body);
+  const ints = items.filter(i=>i.tag===0x02).map(i=>big(i.body));
+  if(ints.length<4) throw new DecodeError("ключ: это не RSA-ключ");
+  return {n:ints[1], d:ints[3]};
+}
+function modpow(b,e,m){ let r=1n; b%=m; while(e>0n){ if(e&1n) r=r*b%m; e>>=1n; b=b*b%m; } return r; }
+function rsaDecrypt(data,pem){
+  const {n,d}=loadKey(pem), k=Math.ceil(n.toString(2).length/8);
+  if(data.length % k) throw new DecodeError(`шифртекст (${data.length} байт) не кратен размеру ключа (${k})`);
+  const out=[];
+  for(let i=0;i<data.length;i+=k){
+    const em = modpow(big(data.subarray(i,i+k)),d,n).toString(16).padStart(k*2,"0");
+    const b = em.match(/../g).map(h=>parseInt(h,16));
+    const z = b.indexOf(0,2);
+    if(b[0]!==0||b[1]!==2||z<0) throw new DecodeError("RSA: неверный ключ или паддинг");
+    out.push(...b.slice(z+1));
+  }
+  return new Uint8Array(out);
+}
+
+// ---- ссылки ----
+const dec = s => { try{ return decodeURIComponent(s); }catch{ return s; } };
+function parseLink(link){
+  const scheme = link.split("://")[0].toLowerCase();
+  if(scheme==="vmess"){
+    const raw=b64loose(link.slice(8).split("#")[0]), t=raw&&asText(raw);
+    if(t){ try{ return {protocol:"vmess",...JSON.parse(t)}; }catch{} }
+    return {protocol:"vmess",raw:link};
+  }
+  if(scheme==="ss") return parseSS(link);
+  let u; try{ u=new URL(link); }catch{ return {protocol:scheme,raw:link}; }
+  const o={protocol:scheme,name:dec(u.hash.slice(1))||undefined,host:u.hostname.replace(/^\[|\]$/g,""),
+    port:u.port?+u.port:undefined,user:u.username?dec(u.username):undefined,
+    password:u.password?dec(u.password):undefined,params:Object.fromEntries(u.searchParams)};
+  if(!Object.keys(o.params).length) delete o.params;
+  return Object.fromEntries(Object.entries(o).filter(([,v])=>v!==undefined));
+}
+function parseSS(link){
+  let [body,frag=""]=link.slice(5).split(/#(.*)/s).slice(0,2);
+  let query; [body,query]=body.split(/\?(.*)/s);
+  const o={protocol:"ss",name:dec(frag)||undefined};
+  if(!body.includes("@")){ const r=b64loose(body); body=(r&&asText(r))||body; }
+  const at=body.lastIndexOf("@");
+  let cred=body.slice(0,at), hp=body.slice(at+1);
+  if(!cred.includes(":")){ const r=b64loose(dec(cred)); cred=(r&&asText(r))||cred; }
+  const ci=cred.indexOf(":"), pi=hp.lastIndexOf(":");
+  Object.assign(o,{method:cred.slice(0,ci),password:cred.slice(ci+1),host:hp.slice(0,pi).replace(/^\[|\]$/g,""),port:+hp.slice(pi+1)||undefined});
+  if(query) o.params=Object.fromEntries(new URLSearchParams(query));
+  return Object.fromEntries(Object.entries(o).filter(([,v])=>v!==undefined));
+}
+
+// ---- разбор ----
+function decode(text,keyPem,steps=[],depth=0){
+  if(depth>8) throw new DecodeError("слишком глубокая вложенность");
+  text=text.trim().replace(/^﻿/,"");
+  if(!text) throw new DecodeError("пустой ввод");
+  let m=text.match(/^happ:\/\/(crypt\d*)\/([\s\S]+)/i);
+  if(m){
+    steps.push("happ:"+m[1].toLowerCase());
+    if(!keyPem.trim()) throw new DecodeError(m[1]+": ссылка зашифрована RSA. Нужен ваш приватный ключ — раскройте поле выше.");
+    const raw=b64loose(dec(m[2])); if(!raw) throw new DecodeError("crypt: не удалось декодировать base64");
+    return decode(new TextDecoder().decode(rsaDecrypt(raw,keyPem)),keyPem,steps,depth+1);
+  }
+  m=text.match(/^happ:\/\/add\/([\s\S]+)/i);
+  if(m){ steps.push("happ:add"); return decode(dec(m[1]),keyPem,steps,depth+1); }
+  if(/^https?:\/\/\S+$/.test(text))
+    throw new DecodeError("Это URL: браузер не может скачать подписку из-за CORS. Откройте ссылку, скопируйте содержимое сюда или используйте CLI (subdec.py).");
+  if("{[".includes(text[0])){
+    try{ const j=JSON.parse(text); steps.push("json"); return {steps,links:[],configs:[],json:j}; }catch{}
+  }
+  const links=text.split(/\r?\n/).map(l=>l.trim()).filter(l=>l.includes("://")&&SCHEMES.includes(l.split("://")[0].toLowerCase()));
+  if(links.length){ steps.push("links"); return {steps,links,configs:links.map(parseLink),json:null}; }
+  const raw=b64loose(text), inner=raw&&asText(raw);
+  if(inner){ steps.push("base64"); return decode(inner,keyPem,steps,depth+1); }
+  throw new DecodeError("формат не распознан");
+}
+
+// ---- UI ----
+const $ = id => document.getElementById(id);
+let result=null, view="all";
+function render(){
+  const o = view==="all" ? result : result[view];
+  $("res").textContent = JSON.stringify(o,null,2);
+}
+function show(r){
+  result=r; view="all";
+  $("out").hidden=false;
+  $("steps").innerHTML = r.steps.map(s=>`<span class="chip">${s}</span>`).join("");
+  const tabs=["all","configs","links",...(r.json!==null?["json"]:[])];
+  $("tabs").innerHTML = tabs.map(t=>`<button class="ghost" data-v="${t}">${t==="all"?"всё":t}</button>`).join("");
+  render();
+}
+$("tabs").onclick = e => { if(e.target.dataset.v){ view=e.target.dataset.v; render(); } };
+$("go").onclick = () => {
+  try{ show(decode($("in").value,$("key").value)); }
+  catch(e){
+    if(!(e instanceof DecodeError)) console.error(e);
+    result=null; $("out").hidden=false; $("steps").textContent=""; $("tabs").textContent="";
+    $("res").textContent = e instanceof DecodeError ? e.message : "Ошибка: "+e.message;
+    $("res").className="err"; return;
+  }
+  $("res").className="";
+};
+$("copy").onclick = async () => { await navigator.clipboard.writeText($("res").textContent); $("copy").textContent="Скопировано"; setTimeout(()=>$("copy").textContent="Копировать",1200); };
+$("save").onclick = () => { const a=document.createElement("a"); a.href=URL.createObjectURL(new Blob([$("res").textContent],{type:"application/json"})); a.download="subscription.json"; a.click(); URL.revokeObjectURL(a.href); };
+$("clear").onclick = () => { $("in").value=""; $("key").value=""; $("out").hidden=true; };
+$("file").onclick = () => $("fileIn").click();
+$("fileIn").onchange = async e => { const f=e.target.files[0]; if(f){ $("in").value=await f.text(); $("go").click(); } };
+$("in").addEventListener("keydown", e => { if(e.key==="Enter"&&(e.ctrlKey||e.metaKey)) $("go").click(); });
+</script>
+</body>
+</html>
